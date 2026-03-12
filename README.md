@@ -93,6 +93,82 @@ These endpoints are designed to be compatible with OpenAI's API structure, allow
 
 - **`POST /v1/responses`**: An alternative endpoint for complex interaction patterns, supporting rich output items including generated images and tool calls.
 
+### Image-to-Image Example
+
+For image-to-image requests, the most reliable flow is:
+
+1. Upload the reference image with **`POST /v1/files`**
+2. Reuse the returned `file_id` in **`POST /v1/chat/completions`** or **`POST /v1/responses`**
+
+Example upload:
+
+```bash
+curl http://127.0.0.1:8000/v1/files \
+  -H "Authorization: Bearer your-api-key-here" \
+  -F "purpose=vision" \
+  -F "file=@/absolute/path/to/room.jpg"
+```
+
+Then call `/v1/chat/completions`:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.0-flash",
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Transform this room into an industrial-style interior and generate one new high-quality image."
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_id": "file-xxx"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Equivalent `/v1/responses` request:
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.0-flash",
+    "stream": false,
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Transform this room into an industrial-style interior and generate one new high-quality image."
+          },
+          {
+            "type": "input_file",
+            "file_id": "file-xxx",
+            "filename": "room.jpg"
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+> [!TIP]
+> Stable image generation depends not only on code paths, but also on Gemini account status, valid cookies, and proxy/network quality.
+
 ### Utility Endpoints
 
 - **`GET /health`**: Health check endpoint. Returns the status of the server, configured Gemini clients, and conversation storage.

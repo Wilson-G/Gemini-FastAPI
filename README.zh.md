@@ -93,6 +93,82 @@ python run.py
 
 - **`POST /v1/responses`**: 用于复杂交互模式的专用接口，支持分步输出、生成图片及工具调用等更丰富的响应项。
 
+### 图生图调用示例
+
+图生图建议优先走两步：
+
+1. 先通过 **`POST /v1/files`** 上传参考图，拿到 `file_id`
+2. 再通过 **`POST /v1/chat/completions`** 或 **`POST /v1/responses`** 引用该 `file_id`
+
+`/v1/chat/completions` 示例：
+
+```bash
+curl http://127.0.0.1:8000/v1/files \
+  -H "Authorization: Bearer your-api-key-here" \
+  -F "purpose=vision" \
+  -F "file=@/absolute/path/to/room.jpg"
+```
+
+返回中的 `id` 形如 `file-xxx`。随后发起图生图请求：
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.0-flash",
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "请参考这张图片，把它改造成工业风装修风格，并生成一张新的高质量效果图。"
+          },
+          {
+            "type": "file",
+            "file": {
+              "file_id": "file-xxx"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+`/v1/responses` 也支持同样的文件引用方式：
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-3.0-flash",
+    "stream": false,
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "请参考这张图片，把它改造成工业风装修风格，并生成一张新的高质量效果图。"
+          },
+          {
+            "type": "input_file",
+            "file_id": "file-xxx",
+            "filename": "room.jpg"
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+> [!TIP]
+> 图生图请求能否稳定出图，除了代码链路外，还强依赖 Gemini 账号状态、Cookie 有效性以及代理网络质量。
+
 ### 辅助与系统接口
 
 - **`GET /health`**: 健康检查接口。返回服务器运行状态、已配置的 Gemini 客户端健康度以及对话存储统计信息。

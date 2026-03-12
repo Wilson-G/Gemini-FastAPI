@@ -119,6 +119,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = Field(default=0.7)
     top_p: float | None = Field(default=1.0)
     max_tokens: int | None = Field(default=None)
+    temporary: bool | None = Field(default=False)
     tools: list[Tool] | None = Field(default=None)
     tool_choice: (
         Literal["none"] | Literal["auto"] | Literal["required"] | ToolChoiceFunction | None
@@ -177,6 +178,7 @@ class ResponseInputContent(BaseModel):
     detail: Literal["auto", "low", "high"] | None = Field(default=None)
     file_url: str | None = Field(default=None)
     file_data: str | None = Field(default=None)
+    file_id: str | None = Field(default=None)
     filename: str | None = Field(default=None)
     annotations: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -214,6 +216,7 @@ class ResponseCreateRequest(BaseModel):
     top_p: float | None = Field(default=1.0)
     max_output_tokens: int | None = Field(default=None)
     stream: bool | None = Field(default=False)
+    temporary: bool | None = Field(default=False)
     tool_choice: str | ResponseToolChoice | None = Field(default=None)
     tools: list[Tool | ResponseImageTool] | None = Field(default=None)
     store: bool | None = Field(default=None)
@@ -336,6 +339,54 @@ class ResponseCreateResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     input: str | list[ResponseInputItem] | None = Field(default=None)
     text: ResponseTextConfig | None = Field(default_factory=ResponseTextConfig)
+
+
+class ImageGenerationRequest(BaseModel):
+    """OpenAI Images API request payload."""
+
+    prompt: str
+    model: str
+    n: int | None = Field(default=1)
+    quality: str | None = Field(default=None)
+    response_format: Literal["url", "b64_json"] | None = Field(default="url")
+    size: str | None = Field(default=None)
+    style: str | None = Field(default=None)
+    user: str | None = Field(default=None)
+
+
+class ImageGenerationData(BaseModel):
+    """Single image item in OpenAI Images API response."""
+
+    url: str | None = Field(default=None)
+    b64_json: str | None = Field(default=None)
+    revised_prompt: str | None = Field(default=None)
+
+
+class ImageGenerationResponse(BaseModel):
+    """OpenAI Images API response payload."""
+
+    created: int
+    data: list[ImageGenerationData]
+
+
+class UploadedFileResponse(BaseModel):
+    """OpenAI-style file object."""
+
+    id: str
+    object: Literal["file"] = Field(default="file")
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: str
+    status: Literal["processed"] = Field(default="processed")
+
+
+class DeleteChatResponse(BaseModel):
+    """删除 Gemini 历史会话的返回结构。"""
+
+    id: str
+    deleted: bool = Field(default=True)
+    object: Literal["chat.deleted"] = Field(default="chat.deleted")
 
 
 # Rebuild models with forward references

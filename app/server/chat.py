@@ -24,6 +24,10 @@ from app.models import (
     Choice,
     ContentItem,
     ConversationInStore,
+    DeleteChatResponse,
+    ImageGenerationData,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
     Message,
     ModelData,
     ModelListResponse,
@@ -50,6 +54,7 @@ from app.server.middleware import (
     get_image_store_dir,
     get_image_token,
     get_temp_dir,
+    get_uploaded_file_metadata,
     verify_api_key,
 )
 from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
@@ -69,7 +74,7 @@ from app.utils.helper import (
 )
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
-METADATA_TTL_MINUTES = 15
+METADATA_TTL_MINUTES = 120
 
 router = APIRouter()
 
@@ -614,7 +619,14 @@ def _response_items_to_messages(
                             file_info["filename"] = part.filename
                         if part.file_url:
                             file_info["url"] = part.file_url
+                        if part.file_id:
+                            file_info["file_id"] = part.file_id
                         converted.append(ContentItem(type="file", file=file_info))
+                    elif part.file_id:
+                        normalized_contents.append(part)
+                        converted.append(
+                            ContentItem(type="file", file={"file_id": part.file_id})
+                        )
             messages.append(Message(role=role, content=converted or None))
 
         normalized_input.append(
@@ -675,6 +687,8 @@ def _instructions_to_messages(
                         file_info["filename"] = part.filename
                     if part.file_url:
                         file_info["url"] = part.file_url
+                    if part.file_id:
+                        file_info["file_id"] = part.file_id
                     if file_info:
                         converted.append(ContentItem(type="file", file=file_info))
             instruction_messages.append(
@@ -738,6 +752,59 @@ def _get_available_models() -> list[ModelData]:
     return models_data
 
 
+def _get_preferred_client_id(messages: list[Message]) -> str | None:
+    """根据已上传文件元数据推断本次请求应绑定的 Gemini client。"""
+    client_ids: set[str] = set()
+
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        for item in message.content:
+            if item.type != "file" or not item.file:
+                continue
+            file_id = item.file.get("file_id")
+            if not isinstance(file_id, str) or not file_id:
+                continue
+            metadata = get_uploaded_file_metadata(file_id)
+            client_id = metadata.get("client_id")
+            if isinstance(client_id, str) and client_id:
+                client_ids.add(client_id)
+
+    if len(client_ids) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Attached files were uploaded via different Gemini clients.",
+        )
+    return next(iter(client_ids), None)
+
+
+def _build_image_api_data(
+    image_calls: list[ResponseImageGenerationCall],
+    base_url: str,
+    response_format: str,
+) -> list[ImageGenerationData]:
+    """将内部图片结果转换为 OpenAI Images API 格式。"""
+    data: list[ImageGenerationData] = []
+    for call in image_calls:
+        image_url = None
+        if call.output_format:
+            fname = f"{call.id}.{call.output_format}"
+            image_url = f"{base_url}images/{fname}?token={get_image_token(fname)}"
+
+        item = ImageGenerationData(revised_prompt=call.revised_prompt)
+        if response_format == "b64_json":
+            item.b64_json = call.result
+        else:
+            item.url = image_url
+
+        if not item.url and not item.b64_json:
+            item.url = image_url
+            item.b64_json = call.result
+        data.append(item)
+
+    return data
+
+
 async def _find_reusable_session(
     db: LMDBConversationStore,
     pool: GeminiClientPool,
@@ -788,13 +855,14 @@ async def _send_with_split(
     text: str,
     files: list[Path | str | io.BytesIO] | None = None,
     stream: bool = False,
+    temporary: bool = False,
 ) -> AsyncGenerator[ModelOutput] | ModelOutput:
     """Send text to Gemini, splitting or converting to attachment if too long."""
     if len(text) <= MAX_CHARS_PER_REQUEST:
         try:
             if stream:
-                return session.send_message_stream(text, files=files)
-            return await session.send_message(text, files=files)
+                return session.send_message_stream(text, files=files, temporary=temporary)
+            return await session.send_message(text, files=files, temporary=temporary)
         except Exception as e:
             logger.exception(f"Error sending message to Gemini: {e}")
             raise
@@ -815,8 +883,10 @@ async def _send_with_split(
             "3. Execute the instructions or answer the questions found *inside* that file immediately.\n"
         )
         if stream:
-            return session.send_message_stream(instruction, files=final_files)
-        return await session.send_message(instruction, files=final_files)
+            return session.send_message_stream(
+                instruction, files=final_files, temporary=temporary
+            )
+        return await session.send_message(instruction, files=final_files, temporary=temporary)
     except Exception as e:
         logger.exception(f"Error sending large text as file to Gemini: {e}")
         raise
@@ -922,6 +992,7 @@ def _create_real_streaming_response(
     client_wrapper: GeminiClientWrapper,
     session: ChatSession,
     base_url: str,
+    temporary: bool = False,
     structured_requirement: StructuredOutputRequirement | None = None,
 ) -> StreamingResponse:
     """
@@ -1086,16 +1157,17 @@ def _create_real_streaming_response(
             ],
             "usage": usage.model_dump(mode="json"),
         }
-        _persist_conversation(
-            db,
-            model.model_name,
-            client_wrapper.id,
-            session.metadata,
-            messages,
-            storage_output,
-            tool_calls,
-            full_thoughts,
-        )
+        if not temporary:
+            _persist_conversation(
+                db,
+                model.model_name,
+                client_wrapper.id,
+                session.metadata,
+                messages,
+                storage_output,
+                tool_calls,
+                full_thoughts,
+            )
         yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -1540,16 +1612,17 @@ def _create_responses_real_streaming_response(
             None,
             full_thoughts,
         )
-        _persist_conversation(
-            db,
-            model.model_name,
-            client_wrapper.id,
-            session.metadata,
-            messages,
-            storage_output,
-            detected_tool_calls,
-            full_thoughts,
-        )
+        if not (getattr(request, "temporary", False) or request.store is False):
+            _persist_conversation(
+                db,
+                model.model_name,
+                client_wrapper.id,
+                session.metadata,
+                messages,
+                storage_output,
+                detected_tool_calls,
+                full_thoughts,
+            )
 
         yield make_event(
             "response.completed",
@@ -1574,6 +1647,79 @@ async def list_models(api_key: str = Depends(verify_api_key)):
     return ModelListResponse(data=models)
 
 
+@router.post("/v1/images/generations", response_model=ImageGenerationResponse)
+async def create_image(
+    request: ImageGenerationRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key),
+    tmp_dir: Path = Depends(get_temp_dir),
+    image_store: Path = Depends(get_image_store_dir),
+):
+    if request.n not in (None, 1):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only n=1 is currently supported.",
+        )
+
+    response_request = ResponseCreateRequest(
+        model=request.model,
+        input=[
+            ResponseInputItem(
+                role="user",
+                content=[ResponseInputContent(type="input_text", text=request.prompt)],
+            )
+        ],
+        tools=[ResponseImageTool(type="image_generation")],
+        tool_choice=ResponseToolChoice(type="image_generation"),
+        user=request.user,
+    )
+    response = await create_response(
+        response_request,
+        raw_request,
+        api_key,
+        tmp_dir,
+        image_store,
+    )
+
+    image_calls = [item for item in response.output if isinstance(item, ResponseImageGenerationCall)]
+    if not image_calls:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No images returned.",
+        )
+
+    return ImageGenerationResponse(
+        created=int(datetime.now(tz=UTC).timestamp()),
+        data=_build_image_api_data(
+            image_calls,
+            str(raw_request.base_url),
+            request.response_format or "url",
+        ),
+    )
+
+
+@router.delete("/v1/chats/{chat_id}", response_model=DeleteChatResponse)
+async def delete_chat(
+    chat_id: str,
+    api_key: str = Depends(verify_api_key),
+):
+    pool = GeminiClientPool()
+    last_error: Exception | None = None
+
+    for configured_client in pool.clients:
+        try:
+            client = await pool.acquire(configured_client.id)
+            await client.delete_chat(chat_id)
+            return DeleteChatResponse(id=chat_id)
+        except Exception as exc:
+            last_error = exc
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"Failed to delete Gemini chat {chat_id}: {last_error}",
+    )
+
+
 @router.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -1584,6 +1730,7 @@ async def create_chat_completion(
 ):
     base_url = str(raw_request.base_url)
     pool, db = GeminiClientPool(), LMDBConversationStore()
+    is_temporary = bool(request.temporary)
     try:
         model = _get_model_by_name(request.model)
     except ValueError as exc:
@@ -1601,10 +1748,16 @@ async def create_chat_completion(
         request.tool_choice,
         extra_instr,
     )
+    preferred_client_id = _get_preferred_client_id(msgs)
 
     session, client, remain = await _find_reusable_session(db, pool, model, msgs)
 
     if session:
+        if preferred_client_id and client and client.id != preferred_client_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Attached files belong to a different Gemini client than the reused session.",
+            )
         if not remain:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No new messages.")
 
@@ -1624,7 +1777,7 @@ async def create_chat_completion(
         )
     else:
         try:
-            client = await pool.acquire()
+            client = await pool.acquire(preferred_client_id)
             session = client.start_chat(model=model)
             # Use the already prepared 'msgs' for a fresh session
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
@@ -1643,7 +1796,11 @@ async def create_chat_completion(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
         resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=request.stream
+            session,
+            m_input,
+            files=files,
+            stream=request.stream,
+            temporary=is_temporary,
         )
     except Exception as e:
         logger.exception("Gemini API error")
@@ -1661,6 +1818,7 @@ async def create_chat_completion(
             client,
             session,
             base_url,
+            is_temporary,
             structured_requirement,
         )
 
@@ -1721,16 +1879,17 @@ async def create_chat_completion(
         usage,
         thoughts,
     )
-    _persist_conversation(
-        db,
-        model.model_name,
-        client.id,
-        session.metadata,
-        msgs,  # Use prepared messages 'msgs'
-        storage_output,
-        tool_calls,
-        thoughts,
-    )
+    if not is_temporary:
+        _persist_conversation(
+            db,
+            model.model_name,
+            client.id,
+            session.metadata,
+            msgs,  # Use prepared messages 'msgs'
+            storage_output,
+            tool_calls,
+            thoughts,
+        )
     return payload
 
 
@@ -1743,6 +1902,7 @@ async def create_response(
     image_store: Path = Depends(get_image_store_dir),
 ):
     base_url = str(raw_request.base_url)
+    is_temporary = bool(request.temporary) or request.store is False
     base_messages, norm_input = _response_items_to_messages(request.input)
     struct_req = _build_structured_requirement(request.response_format)
     extra_instr = [struct_req.instruction] if struct_req else []
@@ -1778,6 +1938,7 @@ async def create_response(
         model_tool_choice,
         extra_instr or None,
     )
+    preferred_client_id = _get_preferred_client_id(messages)
     pool, db = GeminiClientPool(), LMDBConversationStore()
     try:
         model = _get_model_by_name(request.model)
@@ -1786,10 +1947,15 @@ async def create_response(
 
     session, client, remain = await _find_reusable_session(db, pool, model, messages)
     if session:
+        if preferred_client_id and client and client.id != preferred_client_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Attached files belong to a different Gemini client than the reused session.",
+            )
         msgs = _prepare_messages_for_model(
             remain,
-            request.tools,
-            request.tool_choice,
+            standard_tools or None,
+            model_tool_choice,
             None,
             False,
         )
@@ -1801,7 +1967,7 @@ async def create_response(
         )
     else:
         try:
-            client = await pool.acquire()
+            client = await pool.acquire(preferred_client_id)
             session = client.start_chat(model=model)
             m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
         except Exception as e:
@@ -1819,7 +1985,11 @@ async def create_response(
             f"Client ID: {client.id}, Input length: {len(m_input)}, files count: {len(files)}"
         )
         resp_or_stream = await _send_with_split(
-            session, m_input, files=files, stream=request.stream
+            session,
+            m_input,
+            files=files,
+            stream=request.stream,
+            temporary=is_temporary,
         )
     except Exception as e:
         logger.exception("Gemini API error")
@@ -1929,14 +2099,15 @@ async def create_response(
         norm_input,
         thoughts,
     )
-    _persist_conversation(
-        db,
-        model.model_name,
-        client.id,
-        session.metadata,
-        messages,
-        storage_output,
-        tool_calls,
-        thoughts,
-    )
+    if not is_temporary:
+        _persist_conversation(
+            db,
+            model.model_name,
+            client.id,
+            session.metadata,
+            messages,
+            storage_output,
+            tool_calls,
+            thoughts,
+        )
     return payload

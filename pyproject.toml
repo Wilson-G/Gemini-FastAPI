@@ -13,6 +13,8 @@ dependencies = [
     "loguru>=0.7.3",
     "orjson>=3.11.7",
     "pydantic-settings[yaml]>=2.13.1",
+    "python-multipart>=0.0.20",
+    "socksio>=1.0.0",
     "uvicorn>=0.41.0",
     "uvloop>=0.22.1; sys_platform != 'win32'",
 ]

@@ -1,9 +1,12 @@
 import hashlib
 import hmac
+import mimetypes
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
+import orjson
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -15,11 +18,18 @@ from app.utils import g_config
 # Persistent directory for storing generated images
 IMAGE_STORE_DIR = Path(g_config.storage.images_path)
 IMAGE_STORE_DIR.mkdir(parents=True, exist_ok=True)
+FILE_STORE_DIR = Path(g_config.storage.path).parent / "files"
+FILE_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_image_store_dir() -> Path:
     """Returns a persistent directory for storing images."""
     return IMAGE_STORE_DIR
+
+
+def get_file_store_dir() -> Path:
+    """返回持久化上传文件目录。"""
+    return FILE_STORE_DIR
 
 
 def get_image_token(filename: str) -> str:
@@ -87,6 +97,68 @@ def get_temp_dir():
         yield Path(temp_dir.name)
     finally:
         temp_dir.cleanup()
+
+
+def _write_uploaded_file_metadata(file_id: str, metadata: dict[str, str | int | None]) -> None:
+    """写入上传文件元数据。"""
+    (FILE_STORE_DIR / f"{file_id}.json").write_text(
+        orjson.dumps(metadata).decode("utf-8"), encoding="utf-8"
+    )
+
+
+def create_uploaded_file(data: bytes, filename: str, purpose: str) -> dict[str, str | int | None]:
+    """持久化上传文件并返回元数据。"""
+    file_id = f"file-{uuid.uuid4().hex}"
+    suffix = Path(filename).suffix or mimetypes.guess_extension(
+        mimetypes.guess_type(filename)[0] or ""
+    )
+    stored_name = f"{file_id}{suffix or ''}"
+    stored_path = FILE_STORE_DIR / stored_name
+    stored_path.write_bytes(data)
+
+    created_at = int(time.time())
+    metadata = {
+        "id": file_id,
+        "filename": filename,
+        "purpose": purpose,
+        "bytes": len(data),
+        "created_at": created_at,
+        "path": stored_name,
+        "client_id": None,
+        "gemini_file_url": None,
+        "uploaded_at": None,
+    }
+    _write_uploaded_file_metadata(file_id, metadata)
+    return metadata
+
+
+def update_uploaded_file_metadata(file_id: str, **updates: str | int | None) -> dict[str, str | int | None]:
+    """更新上传文件元数据。"""
+    metadata = get_uploaded_file_metadata(file_id)
+    metadata.update(updates)
+    _write_uploaded_file_metadata(file_id, metadata)
+    return metadata
+
+
+def get_uploaded_file_metadata(file_id: str) -> dict[str, str | int | None]:
+    """读取上传文件元数据。"""
+    metadata_path = FILE_STORE_DIR / f"{file_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return orjson.loads(metadata_path.read_bytes())
+
+
+def get_uploaded_file_path(file_id: str) -> Path:
+    """根据 file_id 定位已上传文件。"""
+    metadata = get_uploaded_file_metadata(file_id)
+    stored_name = metadata.get("path")
+    if not isinstance(stored_name, str):
+        raise HTTPException(status_code=500, detail="Invalid file metadata")
+    path = FILE_STORE_DIR / stored_name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File content not found")
+    return path
 
 
 def verify_api_key(

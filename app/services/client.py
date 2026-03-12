@@ -1,11 +1,22 @@
+import asyncio
+import io
+import mimetypes
+import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, AsyncGenerator, cast
 
+import curl_cffi
 import orjson
+from curl_cffi.requests import AsyncSession
 from gemini_webapi import GeminiClient, ModelOutput
+from gemini_webapi.client import GRPC, ChatSession, GeminiError, RPCData, parse_file_name
+from gemini_webapi.constants import Endpoint, Headers
 from loguru import logger
 
 from app.models import Message
+from app.server.middleware import get_uploaded_file_metadata, get_uploaded_file_path
 from app.utils import g_config
 from app.utils.helper import (
     add_tag,
@@ -17,8 +28,58 @@ from app.utils.helper import (
 _UNSET = object()
 
 
+@dataclass(slots=True)
+class GeminiUploadedFileRef:
+    """Gemini 上游已完成上传的文件引用。"""
+
+    upload_url: str
+    filename: str
+
+
 def _resolve(value: Any, fallback: Any):
     return fallback if value is _UNSET else value
+
+
+async def _upload_file_compat(
+    file: str | Path | bytes | io.BytesIO,
+    client: AsyncSession,
+    filename: str | None = None,
+) -> str:
+    """兼容当前上游损坏的文件上传实现。"""
+    if isinstance(file, (str, Path)):
+        file_path = Path(file)
+        if not file_path.is_file():
+            raise ValueError(f"{file_path} is not a valid file.")
+        filename = filename or file_path.name
+        file_content = file_path.read_bytes()
+    elif isinstance(file, io.BytesIO):
+        file_content = file.getvalue()
+        filename = filename or parse_file_name(file)
+    elif isinstance(file, bytes):
+        file_content = file
+        filename = filename or parse_file_name(file)
+    else:
+        raise ValueError(f"Unsupported file type: {type(file)}")
+
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    mp = curl_cffi.CurlMime()
+    mp.addpart(name="file", content_type=content_type, filename=filename, data=file_content)
+    try:
+        response = await client.post(
+            url=Endpoint.UPLOAD,
+            headers={
+                "Referer": Headers.GEMINI.value["Referer"],
+                "Origin": Headers.GEMINI.value["Origin"],
+                "User-Agent": Headers.GEMINI.value["User-Agent"],
+                **Headers.UPLOAD.value,
+            },
+            multipart=mp,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        return response.text
+    finally:
+        mp.close()
 
 
 class GeminiClientWrapper(GeminiClient):
@@ -66,15 +127,201 @@ class GeminiClientWrapper(GeminiClient):
     def running(self) -> bool:
         return self._running
 
+    async def _prepare_file_data(
+        self,
+        files: list[str | Path | bytes | io.BytesIO | GeminiUploadedFileRef] | None = None,
+    ) -> list[list[Any]] | None:
+        """统一准备 Gemini 请求所需的文件上传数据。"""
+        file_data = None
+        if files:
+            uploaded_refs = [file for file in files if isinstance(file, GeminiUploadedFileRef)]
+            pending_uploads = [file for file in files if not isinstance(file, GeminiUploadedFileRef)]
+
+            await self._batch_execute(
+                [
+                    RPCData(
+                        rpcid=GRPC.BARD_ACTIVITY,
+                        payload='[[["bard_activity_enabled"]]]',
+                    )
+                ]
+            )
+
+            file_data = [[[ref.upload_url], ref.filename] for ref in uploaded_refs]
+
+            if pending_uploads:
+                async with AsyncSession(
+                    impersonate="chrome",
+                    proxy=self.proxy,
+                    cookies=dict(self.cookies),
+                    timeout=self.timeout,
+                ) as upload_client:
+                    uploaded_urls = await asyncio.gather(
+                        *(_upload_file_compat(file, upload_client) for file in pending_uploads)
+                    )
+
+                file_data.extend(
+                    [
+                        [[url], parse_file_name(file)]
+                        for url, file in zip(uploaded_urls, pending_uploads, strict=False)
+                    ]
+                )
+
+        return file_data
+
+    async def upload_file_reference(
+        self,
+        file: str | Path | bytes | io.BytesIO,
+        filename: str | None = None,
+    ) -> GeminiUploadedFileRef:
+        """先把文件上传到 Gemini, 再返回可复用的文件引用。"""
+        async with AsyncSession(
+            impersonate="chrome",
+            proxy=self.proxy,
+            cookies=dict(self.cookies),
+            timeout=self.timeout,
+        ) as upload_client:
+            upload_url = await _upload_file_compat(file, upload_client, filename=filename)
+
+        resolved_name = filename
+        if resolved_name is None:
+            if isinstance(file, (str, Path)):
+                resolved_name = Path(file).name
+            else:
+                resolved_name = parse_file_name(file)
+
+        return GeminiUploadedFileRef(upload_url=upload_url, filename=resolved_name)
+
+    async def generate_content(
+        self,
+        prompt: str,
+        files: list[str | Path | bytes | io.BytesIO | GeminiUploadedFileRef] | None = None,
+        model: Any = None,
+        gem: Any = None,
+        chat: ChatSession | None = None,
+        temporary: bool = False,
+        **kwargs,
+    ) -> ModelOutput:
+        """
+        兼容上游 gemini_webapi 当前版本的文件上传签名变更。
+        """
+        if self.auto_close:
+            await self.reset_close_task()
+
+        if not (isinstance(chat, ChatSession) and chat.cid):
+            self._reqid = random.randint(10000, 99999)
+
+        file_data = await self._prepare_file_data(files)
+
+        try:
+            await self._batch_execute(
+                [
+                    RPCData(
+                        rpcid=GRPC.BARD_ACTIVITY,
+                        payload='[[["bard_activity_enabled"]]]',
+                    )
+                ]
+            )
+
+            session_state = {
+                "last_texts": {},
+                "last_thoughts": {},
+                "last_progress_time": time.time(),
+            }
+            output = None
+            async for generated_output in self._generate(
+                prompt=prompt,
+                req_file_data=file_data,
+                model=model,
+                gem=gem,
+                chat=chat,
+                temporary=temporary,
+                session_state=session_state,
+                **kwargs,
+            ):
+                output = generated_output
+
+            if output is None:
+                raise GeminiError("Failed to generate contents. No output data found in response.")
+
+            if isinstance(chat, ChatSession):
+                output.metadata = chat.metadata
+                chat.last_output = output
+
+            return output
+        finally:
+            if files:
+                for file in files:
+                    if isinstance(file, io.BytesIO):
+                        file.close()
+
+    async def generate_content_stream(
+        self,
+        prompt: str,
+        files: list[str | Path | bytes | io.BytesIO | GeminiUploadedFileRef] | None = None,
+        model: Any = None,
+        gem: Any = None,
+        chat: ChatSession | None = None,
+        temporary: bool = False,
+        **kwargs,
+    ) -> AsyncGenerator[ModelOutput, None]:
+        """
+        为流式接口补齐与非流式一致的文件上传兼容逻辑。
+        """
+        if self.auto_close:
+            await self.reset_close_task()
+
+        if not (isinstance(chat, ChatSession) and chat.cid):
+            self._reqid = random.randint(10000, 99999)
+
+        file_data = await self._prepare_file_data(files)
+
+        try:
+            await self._batch_execute(
+                [
+                    RPCData(
+                        rpcid=GRPC.BARD_ACTIVITY,
+                        payload='[[["bard_activity_enabled"]]]',
+                    )
+                ]
+            )
+
+            session_state = {
+                "last_texts": {},
+                "last_thoughts": {},
+                "last_progress_time": time.time(),
+            }
+            output = None
+            async for generated_output in self._generate(
+                prompt=prompt,
+                req_file_data=file_data,
+                model=model,
+                gem=gem,
+                chat=chat,
+                temporary=temporary,
+                session_state=session_state,
+                **kwargs,
+            ):
+                output = generated_output
+                yield generated_output
+
+            if output and isinstance(chat, ChatSession):
+                output.metadata = chat.metadata
+                chat.last_output = output
+        finally:
+            if files:
+                for file in files:
+                    if isinstance(file, io.BytesIO):
+                        file.close()
+
     @staticmethod
     async def process_message(
         message: Message, tempdir: Path | None = None, tagged: bool = True, wrap_tool: bool = True
-    ) -> tuple[str, list[Path | str]]:
+    ) -> tuple[str, list[Path | str | GeminiUploadedFileRef]]:
         """
         Process a Message into Gemini API format using the PascalCase technical protocol.
         Extracts text, handles files, and appends ToolCalls/ToolResults blocks.
         """
-        files: list[Path | str] = []
+        files: list[Path | str | GeminiUploadedFileRef] = []
         text_fragments: list[str] = []
 
         if isinstance(message.content, str):
@@ -95,13 +342,26 @@ class GeminiClientWrapper(GeminiClient):
                 elif item.type == "file":
                     if not item.file:
                         raise ValueError("File cannot be empty")
-                    if file_data := item.file.get("file_data", None):
+                    if file_id := item.file.get("file_id", None):
+                        metadata = get_uploaded_file_metadata(file_id)
+                        upload_url = metadata.get("gemini_file_url")
+                        filename = metadata.get("filename")
+                        if isinstance(upload_url, str) and upload_url:
+                            files.append(
+                                GeminiUploadedFileRef(
+                                    upload_url=upload_url,
+                                    filename=filename if isinstance(filename, str) else file_id,
+                                )
+                            )
+                        else:
+                            files.append(get_uploaded_file_path(file_id))
+                    elif file_data := item.file.get("file_data", None):
                         filename = item.file.get("filename", "")
                         files.append(await save_file_to_tempfile(file_data, filename, tempdir))
                     elif url := item.file.get("url", None):
                         files.append(await save_url_to_tempfile(url, tempdir))
                     else:
-                        raise ValueError("File must contain 'file_data' or 'url' key")
+                        raise ValueError("File must contain 'file_id', 'file_data' or 'url' key")
         elif message.content is None and message.role == "tool":
             text_fragments.append("")
         elif message.content is not None:
@@ -155,9 +415,9 @@ class GeminiClientWrapper(GeminiClient):
     @staticmethod
     async def process_conversation(
         messages: list[Message], tempdir: Path | None = None
-    ) -> tuple[str, list[Path | str]]:
+    ) -> tuple[str, list[Path | str | GeminiUploadedFileRef]]:
         conversation: list[str] = []
-        files: list[Path | str] = []
+        files: list[Path | str | GeminiUploadedFileRef] = []
 
         i = 0
         while i < len(messages):
